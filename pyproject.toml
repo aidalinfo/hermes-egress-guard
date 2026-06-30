@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hermes-egress-guard"
+version = "1.0.0"
+description = "Deterministic egress guard hook for Hermes (Nous Research) bots"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = ["pyyaml>=6.0"]
+
+[project.scripts]
+egress-guard = "egress_guard.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/aidalinfo/hermes-egress-guard"
+
+[tool.hatch.build.targets.wheel]
+packages = ["egress_guard"]
+# inclut les fichiers non-.py dans le package (template YAML)
+artifacts = ["egress_guard/guardrails.template.yaml"]

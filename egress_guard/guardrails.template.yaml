@@ -1,0 +1,191 @@
+# ============================================================================
+#  Hermes Egress Guard — Guardrails Template
+#  Basé sur le modèle v2 "egress-first" (Pulse/Aidalinfo, 2026-05-29)
+# ============================================================================
+#  Principe : la sécurité est appliquée AU BOUNDARY, en code déterministe
+#  (hors LLM), par CLASSE D'ACTION et CLASSE DE DONNÉE.
+#  On casse la "lethal trifecta" en contrôlant la patte la plus fiable : la SORTIE.
+#
+#  Réf. : Willison (lethal trifecta) ; DeepMind CaMeL (arXiv 2503.18813) ;
+#  OWASP Agentic Top 10 (12/2025) ; 6 design patterns (arXiv 2506.08837).
+#
+#  INSTALLATION :
+#    1. Copier ce fichier vers /opt/data/guardrails.yaml dans le bot
+#    2. Remplir les sections marquées ← À PERSONNALISER
+#    3. Câbler le hook dans config.yaml (voir hook_entry.py)
+#
+#  Ce fichier est de la CONFIG auditable : n'y mettre AUCUNE valeur secrète.
+# ============================================================================
+
+version: 2
+policy_id: hermes-egress-guard          # ← Donner un identifiant unique par bot
+updated: "2026-01-01"                   # ← Date de la dernière modification
+
+# ---------------------------------------------------------------------------
+# 1) IDENTITÉ — tiers de confiance déterminés par le tenant, pas à la main.
+# ---------------------------------------------------------------------------
+identity:
+  # Domaines appartenant à l'organisation (= tenant Microsoft Entra ou équivalent).
+  # Un email ou un hôte dans ces domaines = tier "internal_verified".
+  internal_domains:          # ← À PERSONNALISER
+    - example.com
+    # - autredomaine.fr
+
+  # Partenaires externes connus -> tier "external_known" (gate au lieu de deny).
+  # À enrichir explicitement, jamais par inférence du modèle.
+  known_partner_domains: []  # ← Optionnel : ["partenaire.com"]
+
+  # Comportement sur les membres guest/externes dans un canal Teams.
+  treat_guest_or_external_member_as: untrusted
+
+  # Identité propre du bot (ne compte jamais comme "approuveur").
+  self_identity: bot@example.com  # ← À PERSONNALISER
+
+  # Comptes autorisés à opérer le bot (par email + tier).
+  # Ces personnes reçoivent les demandes de gate (validation humaine).
+  authorized_senders:        # ← À PERSONNALISER
+    - email: admin@example.com
+      user_name: Admin Prénom NOM
+      tier: internal_verified
+    # - email: partenaire@autredomaine.com
+    #   user_name: Contact Partenaire
+    #   tier: external_known
+
+# ---------------------------------------------------------------------------
+# 2) CLASSES DE DONNÉES SENSIBLES — classification du contenu sortant.
+#    Ces patterns sont intentionnellement génériques et réutilisables.
+#    Ajouter des patterns métier spécifiques sous "custom_sensitive".
+# ---------------------------------------------------------------------------
+sensitivity_classes:
+
+  secrets:
+    severity: critical
+    patterns:
+      - '(?i)\b(api[_-]?key|secret|password|passwd|token|bearer)\b\s*[:=]'
+      - '(?i)-----BEGIN (RSA |EC |OPENSSH |PGP )?PRIVATE KEY-----'
+      - '(?i)\bAKIA[0-9A-Z]{16}\b'
+      - '(?i)\beyJ[A-Za-z0-9_-]{10,}\.'
+      - '(?i)\bgh[pousr]_[A-Za-z0-9]{20,}\b'
+      - '(?i)(mongodb|postgres|postgresql|mysql|redis)://[^ ]+:[^ ]+@'
+
+  infra_inventory:
+    severity: high
+    patterns:
+      - '(?i)\bingress(es)?\b|\bnamespace\b|\bkubectl\b|\bkube(config|ctl)\b'
+      - '(?i)\bcoolify\b.*\b(app|application|service|stack|deployment)s?\b'
+      - '(?i)\btraefik\b|\bnodePort\b|\bclusterIP\b|\bdaemonset\b'
+      - '(?i)(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b.*){3,}'
+      - '(?i)\b(192\.168|10\.|172\.(1[6-9]|2[0-9]|3[01]))\.'
+
+  commercial_sensitive:
+    severity: medium
+    patterns:
+      - '(?i)\b(marge|coût de revient|prix d.achat|remise exceptionnelle)\b'
+      - '(?i)(\b\d{9}\b.*){5,}'
+
+  # Ajouter ici des classes métier propres au bot :
+  # custom_sensitive:
+  #   severity: medium
+  #   patterns:
+  #     - '(?i)\bconfidentiel\b'
+
+# ---------------------------------------------------------------------------
+# 3) DESTINATIONS D'EGRESS — default-deny.
+#    Seuls les hôtes de l'allow-list sont atteignables.
+# ---------------------------------------------------------------------------
+egress:
+  default: deny
+
+  # Hôtes/URL atteignables par les outils web/terminal/ssh.
+  allow_hosts:               # ← À PERSONNALISER (ajouter les hôtes légitimes du bot)
+    - "*.example.com"
+    - github.com
+    - graph.microsoft.com
+    - login.microsoftonline.com
+    - duckduckgo.com
+    - "*.bing.com"
+    # LAN interne (si applicable) :
+    # - 192.168.1.0/24
+
+  # Toujours bloqué — anti-SSRF/metadata (ne pas modifier sauf cas très spécifique).
+  deny_hosts:
+    - 169.254.169.254
+    - metadata.google.internal
+    - "*.internal"
+
+# ---------------------------------------------------------------------------
+# 4) OUTILS À RISQUE D'EGRESS — déclenchent l'évaluation (matcher du hook).
+#    Adapter la liste "tools" aux MCP réellement installés sur ce bot.
+# ---------------------------------------------------------------------------
+egress_tools:
+  email_send:
+    tools: [send_email, send_draft_email, reply_email, reply_all_email, forward_email]
+    recipients_from: [to, cc, bcc, recipients, toRecipients, ccRecipients]
+
+  file_upload:
+    tools: [upload_drive_file, upload_group_file]
+    destination_tier: internal_verified
+
+  outbound_net:
+    tools: [terminal, web_fetch, fetch, http_request]
+    destination_from: [url, host, command]
+    read_tools: [web_fetch, fetch]
+
+  teams_message:
+    tools: [send_chat_message, send_channel_message, send_chat_file_message]
+    tier_from_context: channel_tenancy
+
+# ---------------------------------------------------------------------------
+# 5) TABLE DE RISQUE — (classe de donnée × tier de destination) -> décision.
+#    allow | log | gate (validation humaine) | deny
+# ---------------------------------------------------------------------------
+risk_matrix:
+  secrets:
+    internal_verified: deny
+    external_known:    deny
+    untrusted:         deny
+    unknown:           deny
+
+  infra_inventory:
+    internal_verified: allow   # interne = OK pour les opérations légitimes
+    external_known:    gate
+    untrusted:         deny
+    unknown:           deny
+
+  commercial_sensitive:
+    internal_verified: allow
+    external_known:    gate
+    untrusted:         gate
+    unknown:           gate
+
+  public:
+    internal_verified: allow
+    external_known:    log
+    untrusted:         gate
+    unknown:           log
+
+# ---------------------------------------------------------------------------
+# 6) ACTIONS PAR RÉVERSIBILITÉ — gating indépendant de la sensibilité du contenu.
+#    Adapter la liste "tools" aux outils présents sur ce bot.
+# ---------------------------------------------------------------------------
+action_classes:
+  mutation_reversible:
+    tools: [create_ticket, add_followup, create_mail_folder, create_draft]
+    decision: allow
+
+  mutation_irreversible:
+    tools: [delete_email, delete_ticket, close_ticket, update_contract, create_contract]
+    decision: gate
+
+  destructive_infra:
+    tools: [coolify_deploy, coolify_restart, kubectl_apply, kubectl_delete]
+    decision: gate
+
+# ---------------------------------------------------------------------------
+# 7) AUDIT
+# ---------------------------------------------------------------------------
+audit:
+  log_path: /opt/data/logs/egress-guard.log  # ← Adapter si nécessaire
+  log_allow: false
+  log_decisions: [log, gate, deny]
+  tripwire_on_new_external_host: true
