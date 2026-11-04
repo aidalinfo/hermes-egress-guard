@@ -41,7 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from egress_guard import DEFAULT_POLICY, Decision, evaluate, load_policy  # noqa: E402
 import capability_registry as capreg  # noqa: E402
 
-_URL_TAIL = re.compile(r"""(https?://[^/\s"'<>\\`]+)[^\s"'<>\\`]*""", re.I)
+_URL_TAIL = re.compile(r"""(https?://[^/?#\s"'<>\\`]+)[^\s"'<>\\`]*""", re.I)
 
 
 def scrub(text: str, policy: dict) -> str:
