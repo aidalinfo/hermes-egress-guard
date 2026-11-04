@@ -31,11 +31,11 @@ uvx --from git+https://github.com/aidalinfo/hermes-egress-guard egress-guard che
 ```
 
 `install` fait automatiquement :
-1. Copie `egress_guard.py` + `hook_entry.py` → `/opt/data/workspace/tools/egress-guard/`
+1. Copie `egress_guard.py`, `capability_registry.py`, `hook_entry.py` et `post_hook_entry.py` → `/opt/data/workspace/tools/egress-guard/`
 2. Crée `/opt/data/guardrails.yaml` depuis le template (si absente)
-3. Patche `/opt/data/config.yaml` pour ajouter le hook + `hooks_auto_accept: true` (backup automatique)
+3. Patche `/opt/data/config.yaml` pour ajouter le hook `pre_tool_call`, le hook `post_tool_call` des [capacités temporaires](#capacités-temporaires-tickets-dupload) (si la politique en déclare) et `hooks_auto_accept: true` (backup automatique)
 
-La commande est **idempotente** : relancée sur un bot déjà équipé, elle ne duplique pas le hook.
+La commande est **idempotente** : relancée sur un bot déjà équipé, elle ne duplique pas les hooks. Elle ajoute le hook `post_tool_call` s'il manque et signale un `matcher` `pre_tool_call` existant auquel il manque des outils (elle ne le réécrit pas).
 
 ### Chemins non standard
 
@@ -73,6 +73,7 @@ docker exec <container> sh -c "
 | `identity.self_identity` | Email du bot (exclu des approuveurs) |
 | `egress.allow_hosts` | Hôtes réseau atteignables (défaut-deny sur le reste) |
 | `egress_tools.*.tools` | Outils MCP à surveiller (adapter à ceux installés sur le bot) |
+| `capabilities.*.hosts` | Hôte du Studio auquel un ticket d'upload peut être envoyé |
 
 Le template est consultable ici : [`config/guardrails.template.yaml`](config/guardrails.template.yaml).
 
@@ -122,9 +123,21 @@ Réf. : Willison "lethal trifecta" · DeepMind CaMeL (arXiv 2503.18813) · OWASP
 
 Indépendamment du contenu, certaines actions (suppression, fermeture, déploiement infra) déclenchent un `gate` systématique, configuré dans `action_classes`.
 
+### Capacités temporaires (tickets d'upload)
+
+Un ticket d'upload (par exemple celui que rend `deck_push_begin` du MCP Studio) est une URL signée de forme JWT : il est classé `secrets` et refusé comme tel. Il n'est accepté que s'il a été émis par l'outil de confiance déclaré dans `capabilities` :
+
+1. le hook `post_tool_call` (`post_hook_entry.py`, matcher strict sur le nom exact de l'outil émetteur, par exemple `^(mcp__motion_studio__deck_push_begin)$`) lit le **résultat** de l'outil, que le modèle ne peut pas fabriquer, et enregistre l'empreinte SHA-256 de chaque URL de ticket vers un hôte prévu ;
+2. le hook `pre_tool_call` n'accepte ensuite cette URL que dans la même session, avant expiration (`ttl_seconds`), vers un hôte de `hosts`, dans un outil `consumed_by`, dans une commande **seule** (sans `;`, `|`, `&`, `` ` ``, `<`, `>`, `$(` ni retour à la ligne) conforme à `command_pattern` et sans autre destination ;
+3. il la consomme **une seule fois**, sous verrou exclusif : deux uploads concurrents ne peuvent pas utiliser le même ticket.
+
+Tout le reste est refusé comme avant : autre secret dans la commande, ticket non enregistré, expiré, déjà utilisé ou envoyé ailleurs. Il n'y a aucune exception globale à la classe `secrets`.
+
+Le registre (`capability_registry.path`, `0600`) ne contient que des empreintes, jamais un ticket. Le guard refuse tout appel d'outil qui le cite (`terminal`, `read_file`, `write_file`, `patch`, `search_files`, `execute_code`).
+
 ## Audit
 
-Décisions `log`, `gate`, `deny` journalisées dans `/opt/data/logs/egress-guard.log` (JSON, une ligne par événement). Les `allow` ne sont pas loggués (volume).
+Décisions `log`, `gate`, `deny` journalisées dans `/opt/data/logs/egress-guard.log` (JSON, une ligne par événement). Les `allow` ne sont pas loggués (volume). Le champ `input` est expurgé avant écriture : chemin et paramètres des URL retirés (tickets, signatures), secrets masqués.
 
 ## Tests
 
@@ -147,6 +160,13 @@ C'est de l'**egress applicatif**, pas du netfilter :
 - Protège uniquement les outils listés dans le `matcher` du hook
 - Un process shell exécuté hors hook a un egress OS ouvert
 - Complémentaire (et non substituable) à des règles réseau (iptables, WireGuard…)
+- Le registre des capacités appartient au même utilisateur que l'agent : le guard refuse les appels qui le citent, mais un script obfusqué pourrait l'écrire (comme il pourrait déjà exfiltrer sans passer par le hook). Une entrée forgée ne permet d'envoyer qu'aux hôtes déclarés de la capacité.
+
+## Contrôle réseau : agents-firewall
+
+Pour un contrôle qui ne dépend plus des arguments d'outil, voir [**agents-firewall**](https://github.com/aidalinfo/agents-firewall) : une passerelle réseau placée hors de l'agent (défaut-deny, inspection TLS, journal des flux réels) et une politique centrale pour toute une flotte d'agents.
+
+Il reprend les principes d'egress-guard (classes de données × tiers de destination, classes d'actions) et importe une politique existante avec `afw import egress-guard`. Le guide [Migrer depuis l'egress-guard](https://github.com/aidalinfo/agents-firewall/blob/main/docs/migration-egress-guard.md) décrit le passage d'un bot à l'autre ; les deux protections peuvent tourner ensemble pendant la transition.
 
 ## Structure
 
@@ -155,13 +175,16 @@ hermes-egress-guard/
 ├── egress_guard/
 │   ├── __init__.py
 │   ├── egress_guard.py           # Cœur déterministe (classify + evaluate)
+│   ├── capability_registry.py    # Registre des capacités temporaires (empreintes, verrou)
 │   ├── hook_entry.py             # Adaptateur hook Hermes pre_tool_call
+│   ├── post_hook_entry.py        # Adaptateur hook Hermes post_tool_call (enregistre les tickets)
 │   ├── cli.py                    # CLI : egress-guard install / check
 │   └── guardrails.template.yaml  # Template embarqué dans le package pip/uvx
 ├── config/
 │   └── guardrails.template.yaml  # Même template, lisible sur GitHub
 ├── tests/
-│   └── test_egress_guard.py
+│   ├── test_egress_guard.py
+│   └── test_capabilities.py      # Tickets d'upload (issue #1), hooks lancés en sous-processus
 ├── pyproject.toml
 └── .github/workflows/ci.yml
 ```

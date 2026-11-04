@@ -25,6 +25,11 @@ try:
 except ImportError:
     yaml = None
 
+try:  # importé comme paquet (tests, CLI) ou à plat depuis le dossier du hook
+    from . import capability_registry as _capreg
+except ImportError:
+    import capability_registry as _capreg
+
 # Chemin par défaut dans un bot Hermes (monté sur /opt/data).
 # Surcharger via la variable d'environnement EGRESS_GUARDRAILS (ou PULSE_GUARDRAILS).
 DEFAULT_POLICY = Path("/opt/data/guardrails.yaml")
@@ -38,7 +43,7 @@ _IP = re.compile(r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b")
 _FILE_LIKE_TLDS = {
     "yaml", "yml", "json", "toml", "ini", "env", "txt", "md", "pdf",
     "csv", "xml", "html", "css", "js", "ts", "py", "sh", "log", "out",
-    "run",
+    "run", "mjs", "cjs",
 }
 _EXFIL_RE = re.compile(r"""(?isx)
     \b(scp|rsync|sftp|nc|ncat|telnet)\b
@@ -54,6 +59,10 @@ _PAYLOAD_OPT_RE = re.compile(r"""(?isx)
     \s+
     (?: @?"[^"]*" | @?'[^']*' | @?\S+ )
 """)
+
+
+# Enchaînement shell : une commande qui consomme une capacité doit être SEULE.
+_SHELL_CHAIN = re.compile(r"[;|&`<>\n]|\$\(")
 
 
 def _is_exfil_command(text: str) -> bool:
@@ -225,6 +234,80 @@ def _RANK_TIER(t: str) -> int:
     return {"internal_verified": 0, "external_known": 1, "untrusted": 2, "unknown": 2, "denied": 3}.get(t, 2)
 
 
+def _iter_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [s for v in value.values() for s in _iter_strings(v)]
+    if isinstance(value, (list, tuple)):
+        return [s for v in value for s in _iter_strings(v)]
+    return []
+
+
+def _replace_strings(value: Any, old: str, new: str) -> Any:
+    if isinstance(value, str):
+        return value.replace(old, new)
+    if isinstance(value, dict):
+        return {k: _replace_strings(v, old, new) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_replace_strings(v, old, new) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_strings(v, old, new) for v in value)
+    return value
+
+
+def _apply_capabilities(tool: str, tool_input: dict, session_id: str, policy: dict,
+                        registry: Any) -> tuple[dict, list[str], str]:
+    """Masque UNE URL porteuse d'une capacité enregistrée, si son usage est conforme.
+
+    Retourne (tool_input éventuellement masqué, empreintes consommables, motif de refus).
+    Sans capacité valide et conforme, tool_input est rendu intact : le ticket reste
+    classé `secrets` et le refus habituel s'applique.
+    """
+    if registry is None:
+        return tool_input, [], ""
+    specs = [(n, s) for n, s in _capreg.capability_specs(policy).items()
+             if tool in s.get("consumed_by", [])]
+    if not specs:
+        return tool_input, [], ""
+    strings = _iter_strings(tool_input)
+    urls = [u for s in strings for u in _capreg.CAPABILITY_URL.findall(s)]
+    note = ""
+    for name, spec in specs:
+        hits = [u for u in urls if _capreg.url_matches_spec(u, spec)
+                and registry.valid(_capreg.digest(u), name, session_id)]
+        if not hits:
+            continue
+        if len(hits) != 1:
+            note = f"ticket '{name}' cité plusieurs fois"
+            continue
+        url = hits[0]
+        carrier = next(s for s in strings if url in s)
+        if _SHELL_CHAIN.search(carrier):
+            note = f"ticket '{name}' dans une commande enchaînée (une seule commande attendue)"
+            continue
+        pattern = spec.get("command_pattern")
+        if pattern and not re.search(pattern, carrier):
+            note = f"ticket '{name}' hors de la commande prévue"
+            continue
+        masked = _replace_strings(tool_input, url, f"https://{_capreg.url_host(url)}/")
+        allowed = {h.lower() for h in spec.get("hosts", [])}
+        others = [h for h in _extract_hosts(_gather_text(masked)) if h not in allowed]
+        if others:
+            note = f"ticket '{name}' accompagné d'une autre destination"
+            continue
+        return masked, [_capreg.digest(url)], ""
+    return tool_input, [], note
+
+
+def _touches_registry(tool_input: dict, policy: dict) -> bool:
+    if not _capreg.capability_specs(policy):
+        return False
+    path = _capreg.registry_path(policy)
+    text = _gather_text(tool_input)
+    return str(path.parent) in text or path.name in text
+
+
 def _find_group(tool_name: str, policy: dict) -> tuple[Optional[str], dict]:
     for group, spec in policy.get("egress_tools", {}).items():
         if tool_name in spec.get("tools", []):
@@ -240,11 +323,24 @@ def _action_class_decision(tool_name: str, policy: dict) -> Optional[Decision]:
     return None
 
 
-def evaluate(payload: dict, policy: dict) -> Decision:
-    """payload : {tool_name, tool_input, extra/context}. Retourne une Decision."""
+def evaluate(payload: dict, policy: dict, registry: Any = None) -> Decision:
+    """payload : {tool_name, tool_input, session_id, extra/context}. Retourne une Decision.
+
+    `registry` : capacités temporaires enregistrées (capability_registry.Registry),
+    ou None pour n'en accepter aucune. Une capacité acceptée figure dans
+    `details["capabilities"]` (empreintes) : l'appelant la consomme si l'action passe.
+    """
     tool = payload.get("tool_name", "")
     tool_input = payload.get("tool_input", {}) or {}
     context = payload.get("extra", {}) or payload.get("context", {}) or {}
+    session_id = payload.get("session_id") or ""
+
+    if _touches_registry(tool_input, policy):
+        return Decision("deny", f"{tool}: accès au registre des capacités interdit",
+                        group="capability_registry", details={"tool": tool})
+
+    tool_input, used_caps, cap_note = _apply_capabilities(tool, tool_input, session_id,
+                                                          policy, registry)
 
     candidates: list[Decision] = []
 
@@ -276,6 +372,11 @@ def evaluate(payload: dict, policy: dict) -> Decision:
                                        details={"tool": tool}))
 
     if not candidates:
-        return Decision("allow", group="none")
-
-    return max(candidates, key=lambda d: _RANK[d.action])
+        decision = Decision("allow", group="none")
+    else:
+        decision = max(candidates, key=lambda d: _RANK[d.action])
+    if used_caps:
+        decision.details = {**decision.details, "capabilities": used_caps}
+    if cap_note and decision.blocks:
+        decision.reason = f"{decision.reason} ({cap_note})"
+    return decision
