@@ -20,6 +20,10 @@ coolify_deploy|coolify_restart|kubectl_apply|kubectl_delete"
         timeout: 5
   hooks_auto_accept: true
 
+Capacités temporaires (issue #1) : un ticket émis par un outil de confiance et
+enregistré par post_hook_entry.py est accepté une seule fois, vers son hôte prévu.
+Le registre est ouvert sous verrou exclusif pendant toute la décision.
+
 Variables d'environnement :
   EGRESS_GUARDRAILS   chemin absolu vers guardrails.yaml (défaut : /opt/data/guardrails.yaml)
   PULSE_GUARDRAILS    alias rétro-compatible (priorité si présent)
@@ -28,12 +32,31 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from egress_guard import DEFAULT_POLICY, Decision, evaluate, load_policy  # noqa: E402
+import capability_registry as capreg  # noqa: E402
+
+_URL_TAIL = re.compile(r"""(https?://[^/?#\s"'<>\\`]+)[^\s"'<>\\`]*""", re.I)
+
+
+def scrub(text: str, policy: dict) -> str:
+    """Retire du journal les URL porteuses (chemin, requête, signature) et les secrets."""
+    out = _URL_TAIL.sub(r"\1/…", text or "")
+    secrets = (policy.get("sensitivity_classes", {}) or {}).get("secrets", {}) or {}
+    for pat in secrets.get("patterns", []):
+        flags = 0
+        if pat.startswith("(?i)"):
+            pat, flags = pat[4:], re.I
+        try:
+            out = re.sub(rf"(?:{pat})\S*", "[secret masqué]", out, flags=flags)
+        except re.error:
+            continue
+    return out
 
 
 def _approvers_hint(policy: dict) -> str:
@@ -58,7 +81,7 @@ def _audit(decision: Decision, payload: dict, policy: dict) -> None:
         "sensitivity": decision.sensitivity,
         "tier": decision.tier,
         "reason": decision.reason,
-        "input": str(payload.get("tool_input", ""))[:200],
+        "input": scrub(str(payload.get("tool_input", "")), policy)[:200],
     }
     try:
         p = Path(cfg.get("log_path", "/opt/data/logs/egress-guard.log"))
@@ -67,6 +90,25 @@ def _audit(decision: Decision, payload: dict, policy: dict) -> None:
             f.write(json.dumps(line, ensure_ascii=False) + "\n")
     except OSError:
         pass  # l'audit ne doit jamais faire échouer la décision
+
+
+def _decide(payload: dict, policy: dict) -> Decision:
+    """Évalue ; si une capacité est utilisée et que l'action passe, la consomme.
+
+    Lecture, décision et consommation se font sous le même verrou exclusif.
+    Registre inaccessible : aucune capacité acceptée (le ticket reste un secret).
+    """
+    if not capreg.capability_specs(policy):
+        return evaluate(payload, policy)
+    try:
+        with capreg.open_locked(capreg.registry_path(policy)) as reg:
+            decision = evaluate(payload, policy, registry=reg)
+            used = decision.details.get("capabilities") or []
+            if used and not decision.blocks:
+                reg.consume(used)
+            return decision
+    except OSError:
+        return evaluate(payload, policy)
 
 
 def main() -> int:
@@ -89,7 +131,7 @@ def main() -> int:
                           "reason": f"egress-guard: politique illisible ({exc})"}))
         return 0
 
-    decision = evaluate(payload, policy)
+    decision = _decide(payload, policy)
     _audit(decision, payload, policy)
 
     if decision.action == "deny":
