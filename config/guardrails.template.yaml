@@ -189,3 +189,32 @@ audit:
   log_allow: false
   log_decisions: [log, gate, deny]
   tripwire_on_new_external_host: true
+
+# ---------------------------------------------------------------------------
+# 8) CAPACITÉS TEMPORAIRES — tickets émis par un outil de confiance (issue #1).
+#    Un ticket d'upload (URL signée, forme JWT) est classé "secrets" et refusé.
+#    Il n'est accepté QUE s'il a été lu dans le RÉSULTAT d'un outil "issued_by"
+#    (hook post_tool_call), et seulement :
+#      - vers un hôte de "hosts" (et sous "path_prefix" si renseigné) ;
+#      - dans un outil "consumed_by", une commande SEULE (sans ; | & ` < > $( ni
+#        retour à la ligne) conforme à "command_pattern", sans autre destination ;
+#      - dans la même session, avant expiration, UNE SEULE FOIS.
+#    Aucune exception globale à la classe "secrets" : tout autre secret, un ticket
+#    non enregistré, expiré, déjà utilisé ou envoyé ailleurs reste refusé.
+#    Le registre ne stocke que des empreintes SHA-256 ; le guard refuse tout appel
+#    d'outil qui le cite.
+# ---------------------------------------------------------------------------
+capabilities:
+  studio_push_ticket:
+    # Nom EXACT de l'outil émetteur (vérifié sur le bot ; doubles underscores).
+    # Il sert aussi de matcher strict au hook post_tool_call.
+    issued_by: [mcp__motion_studio__deck_push_begin]
+    consumed_by: [terminal]
+    hosts:                         # ← À PERSONNALISER : hôte du Studio uniquement
+      - studio.example.invalid
+    # path_prefix: /api/push/      # ← recommandé : chemin des tickets d'upload
+    command_pattern: '^\s*node\s+\S*push\.mjs\s+upload\s'
+    ttl_seconds: 900               # 15 min, durée annoncée par deck_push_begin
+
+capability_registry:
+  path: /opt/data/egress-guard/capabilities.json
