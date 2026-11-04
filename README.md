@@ -148,6 +148,12 @@ C'est de l'**egress applicatif**, pas du netfilter :
 - Un process shell exécuté hors hook a un egress OS ouvert
 - Complémentaire (et non substituable) à des règles réseau (iptables, WireGuard…)
 
+## Contrôle réseau : agents-firewall
+
+Pour un contrôle qui ne dépend plus des arguments d'outil, voir [**agents-firewall**](https://github.com/aidalinfo/agents-firewall) : une passerelle réseau placée hors de l'agent (défaut-deny, inspection TLS, journal des flux réels) et une politique centrale pour toute une flotte d'agents.
+
+Il reprend les principes d'egress-guard (classes de données × tiers de destination, classes d'actions) et importe une politique existante avec `afw import egress-guard`. Le guide [Migrer depuis l'egress-guard](https://github.com/aidalinfo/agents-firewall/blob/main/docs/migration-egress-guard.md) décrit le passage d'un bot à l'autre ; les deux protections peuvent tourner ensemble pendant la transition.
+
 ## Structure
 
 ```
